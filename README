@@ -2,4 +2,4 @@
 
 Articles é un software scritto in Python per aggiornare/aggiungere/chiudere 
 inserzioni eBay tramite la tecnologia File Exchange (Scambio File).
-Funziona con un SQLite db e SQLAlchemy
+Funziona con un SQLite db e SQLAlchemy 
