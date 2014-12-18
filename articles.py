@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys, csv, os, xlrd, zipfile, jinja2
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, or_
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.declarative import declarative_base
@@ -41,7 +41,7 @@ class Art(Base):
     ebay_price = Column(Float, default=0.0)
     
     # val >= 0 - subtract to ebay_qty
-    # val <  0 - set ebay_qty = 0
+    # val = -1 - set ebay_qty = 0
     # val < -1 - ebay listing to be close
     sale_control = Column(Integer, default=0)    
     ebay_itemid = Column(Unicode, default=u'')    
@@ -112,7 +112,12 @@ class EbayFx(csv.DictWriter):
 # ---------
 
 DATA_PATH = os.path.join('..', 'Google Drive', 'data')
-ACTION = '*Action(SiteID=Italy|Country=IT|Currency=EUR|Version=745|CC=UTF-8)'
+ACTION = '*Action(SiteID=Italy|Country=IT|Currency=EUR|Version=745|CC=UTF-8)' # smartheaders CONST
+FTPURL = 'garofoli.ftpimg.eu'
+PICURL = 'PicURL=http://'+FTPURL+'/nopic.jpg' # smartheaders CONST
+EMAIL = 'info.garofoli@gmail.com'
+PHONE = '0835/385078'
+INVOICE_FORM_URL = 'http://garofoli.ftpimg.eu/invoice_form'
 
 
 
@@ -139,6 +144,12 @@ def filenames_in(folder):
 
 def ebay_qty_calculation(dsource_row):
     'Reduce by 1 all stores except m9a'
+    # TODO m9a is not being used anymore
+    excluded_stores = {'m93':'closing store', # not used yet
+                       'm94':'closing store',
+                       'm95':'closing store',
+                       'm97':'closing store',
+                       'm9a':'small and highly unreliable'}
     tot = 0
     for k in dsource_row.keys():
         if k == 'ga_code':
@@ -149,18 +160,21 @@ def ebay_qty_calculation(dsource_row):
             tot += (dsource_row[k]-1 if dsource_row[k]>0 else 0)
     return tot
 
-def ebay_price_calculation(b, c, d, dr):
-    'Return price based on a schema'
 
-    if b*c*d*dr == 0: ebay_price = 0 # all prices need to be > 0
-    elif b < 1: ebay_price = 1+6.10 # 5,90 charged to shipping cost
-    elif b+12 <= 50: ebay_price = b+6.10 # 5,90 charged to shipping cost
-    elif b+12 > 50 and b+6.1 <= 100: ebay_price = b+6.1
-    elif b+6.1 > 100 and c+6.1 <= 200: ebay_price = c+6.1
-    elif c+6.1 > 200 and d+6.1 <= 300: ebay_price = d+6.1
-    elif d+6.1 > 300: ebay_price = dr+6.1
+def ebay_price_calc(b, c, d, dr):
+    'Return ebay price based on b, c, d, dr prices (must be float)'
 
-    return ebay_price
+##    # D line price
+##    if d == 0: d = max(b,c,dr) # in case d=0 try to get anyway a price
+##    if 0 < d < 1: d = 1
+##    return d
+
+    # B line price (all prices >= 0)
+    if b == 0: b = max(c,d,dr)
+    if b < 30: return b
+    elif b < 50: return b + 2.44
+    else: return b
+    
 
 def fx_fname(action_name, session):
     'Build & return Fx filename with a sequence number suffix'
@@ -192,14 +206,14 @@ def ebay_cat_n(cat_name, session):
 
 def ebay_title(brand, description, mnf_code):
     'Return cleaned *Title composed by func parameters'
-    mnf_code = '- '+mnf_code
+    mnf_code = mnf_code+' -'
     max_desc_len = 80 - len(brand) - len(mnf_code) -2
-    title = ' '.join((brand, description[:max_desc_len], mnf_code))
+    title = ' '.join((brand, mnf_code, description[:max_desc_len]))
     title = title.replace('<', '').replace('>', '').replace('&', '').replace('"', '')
     return title
 
 def ebay_template(tpl_name, context):
-    'Return html ebay templated description'
+    'Return one line html ebay templated for description field'
     try:
         template_loader = jinja2.FileSystemLoader(
             searchpath=os.path.join(os.getcwd(), 'templates', tpl_name))
@@ -213,6 +227,26 @@ def ebay_template(tpl_name, context):
         print sys.exc_info()[0]
         print sys.exc_info()[1]
 
+
+def items_with_img():
+    'Return gacodes list for items with an img on FTP server'
+
+    from ftplib import FTP
+    ftp = FTP(FTPURL)
+    ftp.login('garofoli@ftpimg.eu', 'KGbA7ZmAq$&9')
+
+    def is_correct_img_fname(fn):
+        'True if img filename is <ddddddd>.jpg d is a digit'
+        name, ext = os.path.splitext(fn)
+        try:
+            if len(name) != 7: raise
+            int(name)
+            return True
+        except:
+            return False
+
+    # ga_codes list for all images on FTP server
+    return [el[:-4] for el in ftp.nlst() if is_correct_img_fname(el)] 
 
 
 
@@ -240,7 +274,7 @@ def dtst_ebay_price_qty_alignment(session):
                     art = session.query(Art).filter(Art.ga_code == ga_code_from_ebay).first()
                     if art:
                         # set/reset changes
-                        ebay_qty = art.ebay_qty - art.sale_control if art.sale_control >= 0 else 0
+                        ebay_qty = art.ebay_qty - art.sale_control if art.sale_control>= 0 and art.ebay_qty - art.sale_control>= 0 else 0
                         if ebay_qty - qty_from_ebay != 0:
                             art.set_change_for('ebay_qty') # set if different
                         else:
@@ -287,6 +321,67 @@ def dtst_ebay_price_qty_alignment(session):
     session.commit()
 
 
+#######################################################
+
+
+
+def _qty_dsource_rows(fxls):
+    'Yield a dict of store-qty'
+
+##    # test support part
+##    folder = os.path.join(DATA_PATH, 'test')
+##    fnames = filenames_in(folder) # a list
+##    fxls = fnames[0] # we have the xls file obj
+    
+    qty = dict() # dict of dicts
+
+    # Load xls file in a dict of dicts
+    with xlrd.open_workbook(fxls) as wbk:
+        sh = wbk.sheet_by_index(0)
+        for r in range(sh.nrows):
+            try:
+                c = str(int(sh.row_values(r)[4])).zfill(7) # ga_code
+                m = 'm'+sh.row_values(r)[11].lower() # i.e. m9a                  
+                q = int(sh.row_values(r)[9]) # never find q=0            
+
+                # initialization
+                if c not in qty:
+                    qty[c] = dict()
+                    qty[c]['ga_code'] = c # usefull when yeld a row
+   
+                # increment
+                qty[c][m] = qty[c].get(m,0) + q
+               
+            except ValueError:
+                pass # discard line with no quantity
+            except:
+                print sys.exc_info()[0]
+                print sys.exc_info()[1]
+
+    # stats
+    print 'C/V stores stats'
+    print '----------------', '\n'
+
+    print 'Num of items in all stores:', len(qty), '\n'
+
+    store_stats = dict()
+
+    for gacode in qty:
+        for m in qty[gacode]:
+            # init
+            if m not in store_stats:
+                store_stats[m] = {'itms':0, 'pcs':0}
+            # inc    
+            store_stats[m]['itms'] = store_stats[m]['itms'] + 1
+            store_stats[m]['pcs'] = store_stats[m]['pcs'] + qty[gacode][m]
+        yield qty[gacode]
+
+    print 'Pcs in all stores:', 
+
+
+                
+#######################################################
+                    
 def qty_dsource_rows(fxls):
     'Yield a row of stores quantities'
     #Able to read DisponibilitaContovendita.xls
@@ -297,8 +392,11 @@ def qty_dsource_rows(fxls):
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    all_stores = ('m9a', 'm9b', 'm90', 'm91', 'm92', 'm93', 'm96', 'm97', 'm98')
+    all_stores = ('m9b', 'm9c', 'm90', 'm91', 'm92', 'm96', 'm98')
     # 6 June, removed Andria stores 9C, 94, 95. They are moving, possible missing items
+    # 23 Sep, added 9C
+    # 11 August, removed m9a Matera. Highly unreliable with few items
+    # 13 September removed 93 (closing) and 97 (problems). 
     m9_table_declaration_part = ' INTEGER DEFAULT 0, '.join(all_stores)
 
     # create temp table
@@ -306,7 +404,7 @@ def qty_dsource_rows(fxls):
                 m9_table_declaration_part+
                 ' INTEGER DEFAULT 0)')
 
-    excluded_stores_items_counter = dict();
+    excluded_stores_items_counter = dict()
 
     # Load xls files in a temporary sqlite table
     with xlrd.open_workbook(fxls) as wbk:
@@ -377,17 +475,17 @@ def qty_loader(session):
                     dstore_row['ga_code']=dsource_row['ga_code']
                     dstore_row['ebay_qty']=ebay_qty_calculation(dsource_row)
                     
-                    art = session.query(Art).options(load_only('id', 'ebay_qty', 'ebay_itemid', 'changes'))\
-                          .filter(Art.ga_code == dstore_row['ga_code']).first()
+                    art = session.query(Art).filter(Art.ga_code == dstore_row['ga_code']).first()                    
                     if art: # exsist                    
                         all_ds_ids.remove(art.id) # because exsists, remove from ids list
 
                         if art.ebay_qty != dstore_row['ebay_qty']: # if qty is to update
+                            if dstore_row['ga_code'] == '0006968': print 'quantità diverse'
                             for attr, value in dstore_row.items(): # update
                                 setattr(art, attr, value)
                             if (art.ebay_itemid != u''): # if it is online
                                 art.set_change_for('ebay_qty') # set qty change
-                            session.add(art)                    
+                            session.add(art)
                     else:
                         art = Art()
                         for attr, value in dstore_row.items():
@@ -404,14 +502,11 @@ def qty_loader(session):
 
         # for remaining ids set qty=0
         for art_id in all_ds_ids:
-            art_zero_qty = session.query(Art).options(load_only('id', 'ebay_qty', 'ebay_itemid', 'changes'))\
-                          .filter(Art.id == art_id).first() # surely exsist in DtSt
-            if (art_zero_qty.ebay_itemid != u'') and \
-               (art_zero_qty.ebay_qty > 0): # if is also online and with qty>0
-               
+            art_zero_qty = session.query(Art).filter(Art.id == art_id).first() # surely exsist in DtSt
+            if (art_zero_qty.ebay_itemid != u'') and (art_zero_qty.ebay_qty > 0): # if is also online and with qty>0               
                 art_zero_qty.set_change_for('ebay_qty') # set qty change                                
-                art_zero_qty.ebay_qty = 0 # set qty=0
-                session.add(art)
+            art_zero_qty.ebay_qty = 0 # set qty=0
+            session.add(art)
         session.commit()
             
 
@@ -432,9 +527,11 @@ def price_loader(session):
                     dstore_row['price_c']=price(dsource_row[2][14:], dsource_row[2][:6])
                     dstore_row['price_d']=price(dsource_row[3][14:], dsource_row[3][:6])
                     dstore_row['price_dr']=price(dsource_row[4][14:], dsource_row[4][:6])
-                    
-                    dstore_row['ebay_price']=(dstore_row['price_b']+3.66) if dstore_row['price_b'] > 0 else 0.0
-                    #dstore_row['ebay_price']=ebay_price_calculation(dstore_row['price_b'], dstore_row['price_c'], dstore_row['price_d'], dstore_row['price_dr'],)
+                                        
+                    dstore_row['ebay_price']=ebay_price_calc(dstore_row['price_b'],
+                                                             dstore_row['price_c'],
+                                                             dstore_row['price_d'],
+                                                             dstore_row['price_dr'],)
                     
                     art = session.query(Art).options(load_only('id', 'price_b', 'price_c', 'price_d', 'price_dr', 'changes'))\
                           .filter(Art.ga_code == dstore_row['ga_code']).first()
@@ -453,6 +550,7 @@ def price_loader(session):
                     print sys.exc_info()[2]
         os.remove(fname)
         session.commit()
+
 
 def anagrafica_loader(session):
     "Load ('ga_code', 'brand', 'mnf_code', 'description', 'category', 'units_of_sale', 'min_of_sale') into DtSt"
@@ -513,10 +611,11 @@ def revise_qty(session):
 
 def revise_price(session):
     'Fx revise price'
-    smartheaders=(ACTION, 'ItemID', '*StartPrice', 'ShippingProfileName=GLS_it_12')
+    smartheaders=(ACTION, 'ItemID', '*StartPrice', 'ShippingProfileName=GLS_paid')
     arts = session.query(Art)\
            .options(load_only('id', 'ebay_price', 'ebay_itemid', 'changes'))\
            .filter(Art.ebay_itemid != u'', # must be already online
+                   Art.ebay_price >= 1,
                    Art.changes/Art.attr_bit['ebay_price']%2 == 1)
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('revise_price', session))
     with EbayFx(fout_name, smartheaders) as wrt:
@@ -525,48 +624,99 @@ def revise_price(session):
                 fx_revise_row = {ACTION:'Revise',
                                  'ItemID':art.ebay_itemid,
                                  '*StartPrice':art.ebay_price,
-                                 'ShippingProfileName=GLS_it_12':'GLS_it_free' if art.ebay_price > 50 else ''}
+                                 'ShippingProfileName=GLS_paid':''}
                 wrt.writerow(fx_revise_row)
                 art.reset_change_for('ebay_price')
                 session.add(art)
         session.commit()
 
+def ebay_price_db_update(session):
+    'In case you change ebay_price_calc() and want to update DB for a next price_revise'
+    arts = session.query(Art)
+    for art in arts:
+        ebay_price = ebay_price_calc(art.price_b, art.price_c, art.price_d, art.price_dr,)
+        if abs(art.ebay_price - ebay_price) > 0.01:
+            art.ebay_price = ebay_price            
+            if (art.ebay_itemid != u''): # set price change if online
+                art.set_change_for('ebay_price')
+            session.add(art)
+    session.commit()        
+
 def revise_shipping_profile(session):
     'Fx revise shipping profile'
-    smartheaders=(ACTION, 'ItemID', 'ShippingProfileName=GLS_it_12')
+    smartheaders=(ACTION, 'ItemID', 'ShippingProfileName=GLS_paid')
     arts = session.query(Art).filter(Art.ebay_itemid != u'',
-                                    Art.ebay_price > 50)
+                                    Art.price_b >= 30)
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('revise_shipping_profile', session))
     with EbayFx(fout_name, smartheaders) as wrt:
         for art in arts:
             fx_revise_row = {ACTION:'Revise',
                              'ItemID':art.ebay_itemid,
-                             'ShippingProfileName=GLS_it_12':'GLS_it_free'}
-            wrt.writerow(fx_revise_row)
+                             'ShippingProfileName=GLS_paid':'GLS_free'}
+            wrt.writerow(fx_revise_row)   
+    
 
-def revise_picurl(session):
-    'Fx revise PicURL'
-    smartheaders=(ACTION, 'ItemID', 'PicURL')
-    arts = session.query(Art).filter(Art.ebay_itemid != u'') # all online items
+def revise_picurl(session, revise_also_articles_with_defaut_image=True):
+    '''Fx revise PicURL with FTP server hosted images'''
+
+    # all ebay listed items
+    ebay_listed_arts = session.query(Art).filter(Art.ebay_itemid != u'')
+    
+    smartheaders=(ACTION, 'ItemID', PICURL)
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('revise_picurl', session))
+    gacodes_of_images = items_with_img()
+
     with EbayFx(fout_name, smartheaders) as wrt:
-        for article in arts[8700:]:
+        for art in ebay_listed_arts:
             fx_revise_row = {ACTION:'Revise',
-                             'ItemID':article.ebay_itemid,
-                             'PicURL':'http://arredo-luce.com/photos/'+article.ga_code+'.jpg'}
-            wrt.writerow(fx_revise_row)
+                             'ItemID':art.ebay_itemid,
+                             PICURL:''}
+            
+            if art.ga_code in gacodes_of_images:
+                fx_revise_row[PICURL] = 'http://'+FTPURL+'/'+art.ga_code+'.jpg'
+                wrt.writerow(fx_revise_row)
+            elif revise_also_articles_with_defaut_image:
+                wrt.writerow(fx_revise_row)          
+            
+    ftp.close()
+
+
 
 def revise_storecategory(session):
     'Fx revise StoreCategory'
     smartheaders=(ACTION, 'ItemID', 'StoreCategory')
-    arts = session.query(Art).filter(Art.ebay_itemid != u'') # all online items
+    arts = session.query(Art).filter(Art.ebay_itemid != u'') # all listed items
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('revise_StoreCategory', session))
     with EbayFx(fout_name, smartheaders) as wrt:
         for article in arts[8700:]:
             fx_revise_row = {ACTION:'Revise',
                              'ItemID':article.ebay_itemid,
                              'StoreCategory':store_cat_n(article.category, session)}
-            wrt.writerow(fx_revise_row)    
+            wrt.writerow(fx_revise_row)
+
+def revise_template(session):
+    'Fx revise Description'
+    smartheaders = (ACTION, 'ItemID', 'Description')
+    arts = session.query(Art).filter(Art.ebay_itemid != u'') # all listed items
+    fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('revise_template', session))
+    with EbayFx(fout_name, smartheaders) as wrt:
+        #for art in arts[:3730]:
+        #for art in arts[3730:7460]:
+        #for art in arts[7460:11190]:
+        #for art in arts[11190:14920]:
+        for art in arts:
+            title = ebay_title(art.brand, art.description, art.mnf_code)
+            context = {'ga_code':art.ga_code,
+                       'title':title,
+                       'description':'',
+                       'email':EMAIL,
+                       'phone':PHONE,
+                       'invoice_form_url':INVOICE_FORM_URL,}
+            ebay_description = ebay_template('garofoli', context)            
+            fx_revise_row = {ACTION:'Revise',
+                             'ItemID':art.ebay_itemid,
+                             'Description':ebay_description,}
+            wrt.writerow(fx_revise_row)
 
 def add(session):
     'Fx add action'
@@ -574,7 +724,7 @@ def add(session):
                     '*Category=50584',
                     '*Title',
                     'Description',
-                    'PicURL',
+                    PICURL,
                     '*Quantity',
                     '*StartPrice',
                     'StoreCategory=1',
@@ -586,12 +736,12 @@ def add(session):
                     '*Location=Matera',
                     'VATPercent=22',
                     '*ReturnsAcceptedOption=ReturnsAccepted',
-                    'ReturnsWithinOption=Days_14',
+                    'ReturnsWithinOption=Days_30',
                     'ShippingCostPaidByOption=Buyer',                    
                     # Regole di vendita
                     'PaymentProfileName=PayPal-Bonifico',
                     'ReturnProfileName=Reso1',
-                    'ShippingProfileName=GLS_it_12',
+                    'ShippingProfileName=GLS_paid',
                     # specifiche oggetto
                     'C:Marca',
                     'C:Modello',
@@ -606,33 +756,43 @@ def add(session):
                                      Art.ebay_qty > 0)
 
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('add', session))
+    gacodes_of_images = items_with_img()
     with EbayFx(fout_name, smartheaders) as wrt:
         for art in arts:
             title = ebay_title(art.brand, art.description, art.mnf_code)
-            context = {'description':title}
+            context = {'ga_code':art.ga_code,
+                       'title':title,
+                       'description':'',
+                       'email':EMAIL,
+                       'phone':PHONE,
+                       'invoice_form_url':INVOICE_FORM_URL,}
             ebay_description = ebay_template('garofoli', context)
             fx_add_row = {ACTION:'Add',
                           '*Title':title.encode('iso-8859-1'),
                           'Description':ebay_description,
                           '*Quantity':art.ebay_qty,
                           '*StartPrice':art.ebay_price,
-                          'ShippingProfileName=GLS_it_12':'GLS_it_free' if art.ebay_price > 50 else '',
+                          'ShippingProfileName=GLS_paid':'',
                           'CustomLabel':art.ga_code,
-                          'PicURL':'http://arredo-luce.com/photos/'+art.ga_code+'.jpg',
+                          PICURL:'http://'+FTPURL+'/'+art.ga_code+'.jpg' if art.ga_code in gacodes_of_images else '',
                           'StoreCategory=1':store_cat_n(art.category, session),
                           '*Category=50584':ebay_cat_n(art.category, session),
                           'C:Marca':art.brand,
                           'C:Modello':art.mnf_code,
                           'C:Genere':art.category}
             wrt.writerow(fx_add_row)
+                        
 
 
 def end(session):
     'Fx end action'
     smartheaders=(ACTION, 'ItemID', 'EndCode=NotAvailable')
-    arts = session.query(Art).options(load_only('id', 'ebay_price', 'ebay_itemid'))\
-           .filter(Art.ebay_itemid != u'',
-                   Art.sale_control < -1)
+##    arts = session.query(Art).filter(Art.ebay_itemid != u'',
+##                   Art.sale_control >= 0,
+##                   Art.ebay_price <= 10,
+##                   Art.ebay_qty == 0,)
+
+    arts = session.query(Art).filter(Art.ebay_itemid != u'', Art.price_b < 50)
     fout_name = os.path.join(DATA_PATH, 'fx_output', fx_fname('end', session))
     with EbayFx(fout_name, smartheaders) as wrt:
         for art in arts:
@@ -661,4 +821,14 @@ def update_price():
 def allinea():
     ses = Session()
     dtst_ebay_price_qty_alignment(ses)
+    ses.close()
+
+def notsell(ga_code, notes=u''):
+    'Set sale_control to -2'
+    ses = Session()
+    item = ses.query(Art).filter(Art.ga_code == ga_code).first()
+    item.sale_control = -2
+    item.notes = notes
+    ses.add(item)
+    ses.commit()
     ses.close()
